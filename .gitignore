@@ -19,6 +19,11 @@ dist-ssr
 *.backup
 *.backup.*
 
+# Private keys / agent credentials
+secrets/
+*.pem
+*.key
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

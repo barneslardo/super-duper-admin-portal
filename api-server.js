@@ -8,6 +8,9 @@ import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import saml from 'samlify'
 import validator from '@authenio/samlify-xsd-schema-validator'
+import { randomUUID } from 'crypto'
+import { getDelegatedAccessToken } from './lib/agentTokenExchange.js'
+import { makePkce, buildAuthUrl, exchangeCode, verifyIdToken } from './lib/oidc.js'
 
 saml.setSchemaValidator(validator)
 
@@ -455,6 +458,126 @@ app.get('/api/saml/logout', (req, res) => {
     const webRoot = process.env.SAML_SUCCESS_REDIRECT || 'https://ai-admin.skylarbarnes.com/'
     res.redirect(webRoot)
   })
+})
+
+// ======================
+// OIDC login (human admin) — yields the id_token used as the token-exchange subject
+// ======================
+app.get('/api/oidc/login', async (req, res) => {
+  try {
+    const state = randomUUID()
+    const nonce = randomUUID()
+    const { verifier, challenge } = makePkce()
+    req.session.oidc = { state, nonce, verifier }
+    await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()))
+
+    const url = await buildAuthUrl({ state, nonce, codeChallenge: challenge })
+    res.redirect(url)
+  } catch (err) {
+    console.error('[OIDC] login error:', err.message)
+    res.status(500).send('OIDC login failed: ' + err.message)
+  }
+})
+
+app.get('/api/oidc/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query
+    const saved = req.session.oidc
+    if (!saved || !state || state !== saved.state) {
+      return res.status(400).send('Invalid OIDC state')
+    }
+
+    const tokens = await exchangeCode({ code, codeVerifier: saved.verifier })
+    const claims = await verifyIdToken(tokens.id_token, saved.nonce)
+
+    // Establish session (same shape requireAuth + /api/auth/me expect)
+    req.session.user = {
+      id: claims.sub,
+      email: claims.email || claims.preferred_username,
+      name: claims.name || claims.email || claims.preferred_username,
+      login: claims.preferred_username || claims.email,
+      attributes: claims,
+      authMethod: 'oidc',
+    }
+    // Keep the id_token for hop 1 of the agent token exchange
+    req.session.id_token = tokens.id_token
+    delete req.session.oidc
+    await new Promise((resolve, reject) => req.session.save(err => err ? reject(err) : resolve()))
+
+    console.log('[OIDC] Login successful for:', req.session.user.email)
+    const successRedirect = process.env.SAML_SUCCESS_REDIRECT || 'http://localhost:3200/'
+    return res.redirect(successRedirect)
+  } catch (err) {
+    console.error('[OIDC] callback error:', err.message)
+    res.status(401).send('OIDC authentication failed: ' + err.message)
+  }
+})
+
+// ======================
+// Delegated (on-behalf-of) Okta access via agent token exchange (XAA / ID-JAG)
+// Mirror of /api/okta/* but authorized by the human ∩ agent intersection rather than
+// a static token. Requires an OIDC session (id_token).
+// ======================
+function requiredScopeFor(method, oktaPath) {
+  if (/^\/logs/.test(oktaPath)) return 'sdap.logs.read'
+  if (/^\/users/.test(oktaPath)) return method === 'GET' ? 'sdap.users.read' : 'sdap.users.manage'
+  return 'sdap.act'
+}
+
+app.all(/^\/api\/agent\/okta\/.*/, requireAuth, async (req, res) => {
+  const idToken = req.session?.id_token
+  if (!idToken) {
+    return res.status(401).json({ error: 'OIDC id_token required — sign in via /api/oidc/login for delegated (on-behalf-of) access' })
+  }
+
+  const oktaPath = req.originalUrl.replace(/^\/api\/agent\/okta/, '')
+  const need = requiredScopeFor(req.method, oktaPath.split('?')[0])
+
+  // Run the on-behalf-of token exchange (id_token -> ID-JAG -> resource access token)
+  let delegated
+  try {
+    delegated = await getDelegatedAccessToken({ idToken })
+  } catch (e) {
+    return res.status(502).json({ error: 'Token exchange failed', detail: e.message })
+  }
+
+  // Enforce the effective (human ∩ agent) scope the custom AS granted
+  const granted = (delegated.scope || '').split(' ').filter(Boolean)
+  if (!granted.includes(need)) {
+    return res.status(403).json({
+      error: 'Insufficient delegated scope',
+      need,
+      granted,
+      hint: "The intersection of the agent's grants and the signed-in admin's entitlements does not include this scope.",
+    })
+  }
+
+  // SEAM: with the call authorized on-behalf-of the human, perform it against Okta.
+  // In the full XAA model the Okta Management API is itself an XAA resource, called with
+  // `delegated.access_token`. Until that resource connection exists, we make the call with
+  // the app's configured Okta credential — now GATED by the human∩agent authorization above.
+  // See docs/okta-xaa-runbook.md to flip this to the brokered token.
+  const oktaBase = (process.env.OKTA_ORG_URL || process.env.OKTA_API_DOMAIN || '').replace(/\/$/, '')
+  const token = process.env.OKTA_API_TOKEN
+  if (!oktaBase || !token) return res.status(503).json({ error: 'Okta API not configured' })
+
+  try {
+    const oktaRes = await fetch(`${oktaBase}/api/v1${oktaPath}`, {
+      method: req.method,
+      headers: {
+        'Authorization': `SSWS ${token}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: ['POST', 'PUT', 'PATCH'].includes(req.method) ? JSON.stringify(req.body) : undefined,
+    })
+    const text = await oktaRes.text()
+    let data
+    try { data = JSON.parse(text) } catch { data = text }
+    res.status(oktaRes.status).json(data)
+  } catch (e) {
+    res.status(502).json({ error: 'Failed to reach Okta', detail: e.message })
+  }
 })
 
 app.listen(PORT, '0.0.0.0', () => {
