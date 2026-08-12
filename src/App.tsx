@@ -25,6 +25,62 @@ type ModelOption = {
   provider: string
 }
 
+interface PendingAccessRequest {
+  requestId: string
+  status: string
+  actionType?: string
+  description?: string
+  lastPolledAt?: string
+  action?: {
+    type: string
+    target?: Record<string, string>
+    parameters?: Record<string, unknown>
+    description?: string
+  }
+}
+
+const PENDING_STORAGE_KEY = 'sdap_pending_access_requests'
+const ACCESS_REQUEST_POLL_MS = 15000
+
+const TERMINAL_ACCESS_REQUEST_STATUSES = new Set([
+  'denied', 'rejected', 'cancelled', 'canceled', 'expired',
+  'approved_executed', 'approved_execution_failed', 'closed', 'completed',
+])
+
+function isTerminalAccessRequestStatus(status: string) {
+  return TERMINAL_ACCESS_REQUEST_STATUSES.has(String(status || '').toLowerCase())
+}
+
+function accessRequestStatusLabel(status: string) {
+  if (status === 'approved_pending_grant') return 'approved, executing…'
+  return String(status || 'unknown').replace(/_/g, ' ')
+}
+
+function toastForAccessRequestStatus(requestId: string, status: string, execution?: { ok?: boolean; oktaOperation?: string; error?: string }) {
+  const short = `${requestId.slice(0, 8)}…`
+  if (execution?.ok && execution.oktaOperation) {
+    toast.success(`Action completed (${short}): ${execution.oktaOperation}`)
+    return
+  }
+  if (execution && execution.ok === false) {
+    toast.error(`Action failed (${short}): ${execution.error || 'execution error'}`)
+    return
+  }
+  if (['approved_executed', 'completed', 'closed'].includes(status)) {
+    toast.success(`Access request ${short} approved and executed`)
+  } else if (['denied', 'rejected'].includes(status)) {
+    toast.error(`Access request ${short} was denied`)
+  } else if (['cancelled', 'canceled'].includes(status)) {
+    toast.info(`Access request ${short} was cancelled`)
+  } else if (status === 'approved_execution_failed') {
+    toast.error(`Access request ${short} approved but execution failed`)
+  } else if (status === 'expired') {
+    toast.info(`Access request ${short} expired`)
+  } else {
+    toast.info(`Access request ${short}: ${accessRequestStatusLabel(status)}`)
+  }
+}
+
 
 
 const SUGGESTED_PROMPTS = [
@@ -46,8 +102,17 @@ const QUICK_ACTIONS = [
 function App() {
   // UI State
   const [currentView, setCurrentView] = useState<'chat' | 'actions' | 'users' | 'settings'>('chat')
-  const [sidebarOpen, setSidebarOpen] = useState(true)
-  
+  const [sidebarOpen, setSidebarOpen] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth > 768 : true
+  )
+
+  // On mobile the sidebar is an overlay drawer — collapse it after a selection
+  const closeSidebarOnMobile = () => {
+    if (typeof window !== 'undefined' && window.innerWidth <= 768) {
+      setSidebarOpen(false)
+    }
+  }
+
   // Chat State
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [currentConvId, setCurrentConvId] = useState<string | null>(null)
@@ -57,12 +122,17 @@ function App() {
   const [selectedModel, setSelectedModel] = useState<string>('')
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([])
   const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [pendingAccessRequests, setPendingAccessRequests] = useState<PendingAccessRequest[]>([])
+
+  const pendingAccessRequestsRef = useRef<PendingAccessRequest[]>([])
+  const notifiedTerminalRef = useRef<Set<string>>(new Set())
 
   // Auth state for splash page (SP-initiated flow)
   type AuthStatus = 'loading' | 'authenticated' | 'unauthenticated'
   const [authStatus, setAuthStatus] = useState<AuthStatus>('loading')
+  const [needsReauth, setNeedsReauth] = useState(false)
 
-  // Auth state - supports both DEMO_AUTH_BYPASS and real SAML
+  // Auth state - supports both DEMO_AUTH_BYPASS and real OIDC
   const [currentUser, setCurrentUser] = useState({
     name: '',
     email: '',
@@ -111,11 +181,16 @@ function App() {
           setCurrentUser({
             name: data.user.name || data.user.email,
             email: data.user.email,
-            role: data.user.authMethod === 'saml' ? 'Super Admin (SAML JIT)' : 'Admin',
+            role: data.user.authMethod === 'oidc' ? 'Super Admin (OIDC)' : 'Admin',
           })
           setAuthStatus('authenticated')
+          setNeedsReauth(Boolean(data.needsReauth))
+          if (data.needsReauth) {
+            toast.warning('Okta sign-in token expired — sign out and sign in again for agent tools (secrets, delegated API).')
+          }
         } else {
           setAuthStatus('unauthenticated')
+          setNeedsReauth(false)
         }
       })
       .catch(() => {
@@ -124,8 +199,114 @@ function App() {
       .finally(() => setAuthLoading(false))
   }, [])
 
+  // Re-check id_token freshness while signed in (cookie lasts 12h; id_token ~1h)
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return
+    const check = () => {
+      fetch(`${API_BASE}/api/auth/me`, { credentials: 'include' })
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+          if (!data?.user) return
+          const stale = Boolean(data.needsReauth)
+          setNeedsReauth(stale)
+        })
+        .catch(() => {})
+    }
+    const timer = window.setInterval(check, 5 * 60 * 1000)
+    return () => window.clearInterval(timer)
+  }, [authStatus, API_BASE])
+
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    pendingAccessRequestsRef.current = pendingAccessRequests
+  }, [pendingAccessRequests])
+
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return
+    try {
+      const raw = localStorage.getItem(PENDING_STORAGE_KEY)
+      if (raw) {
+        const parsed = JSON.parse(raw) as PendingAccessRequest[]
+        setPendingAccessRequests(parsed.filter(p => p.requestId && !isTerminalAccessRequestStatus(p.status)))
+      }
+    } catch {
+      /* ignore corrupt storage */
+    }
+  }, [authStatus])
+
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return
+
+    const pollAll = async () => {
+      const active = pendingAccessRequestsRef.current.filter(p => !isTerminalAccessRequestStatus(p.status))
+      if (active.length === 0) return
+
+      for (const pending of active) {
+        if (pending.action?.type) {
+          try {
+            await fetch(`${API_BASE}/api/agent/access-request/${encodeURIComponent(pending.requestId)}/context`, {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: pending.action,
+                description: pending.description,
+              }),
+            })
+          } catch {
+            /* context restore is best-effort */
+          }
+        }
+      }
+
+      const updates: { requestId: string; status: string; terminal: boolean; execution?: { ok?: boolean; oktaOperation?: string; error?: string } }[] = []
+      for (const pending of active) {
+        try {
+          const res = await fetch(
+            `${API_BASE}/api/agent/access-request/${encodeURIComponent(pending.requestId)}/status`,
+            { credentials: 'include' }
+          )
+          if (!res.ok) continue
+          const data = await res.json()
+          updates.push({
+            requestId: pending.requestId,
+            status: data.status,
+            terminal: Boolean(data.terminal ?? isTerminalAccessRequestStatus(data.status)),
+            execution: data.execution,
+          })
+        } catch {
+          /* ignore transient poll errors */
+        }
+      }
+
+      if (updates.length === 0) return
+
+      setPendingAccessRequests(prev => {
+        let next = prev.map(p => {
+          const u = updates.find(x => x.requestId === p.requestId)
+          if (!u) return p
+          return { ...p, status: u.status, lastPolledAt: new Date().toISOString() }
+        })
+
+        for (const u of updates) {
+          if (u.terminal && !notifiedTerminalRef.current.has(u.requestId)) {
+            notifiedTerminalRef.current.add(u.requestId)
+            toastForAccessRequestStatus(u.requestId, u.status, u.execution)
+          }
+        }
+
+        next = next.filter(p => !isTerminalAccessRequestStatus(p.status))
+        localStorage.setItem(PENDING_STORAGE_KEY, JSON.stringify(next))
+        return next
+      })
+    }
+
+    pollAll()
+    const timer = window.setInterval(pollAll, ACCESS_REQUEST_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [authStatus, API_BASE])
 
   // Load conversations from localStorage
   useEffect(() => {
@@ -195,6 +376,7 @@ function App() {
     setMessages([])
     setInput('')
     setCurrentView('chat')
+    closeSidebarOnMobile()
     inputRef.current?.focus()
   }
 
@@ -202,6 +384,7 @@ function App() {
     setCurrentConvId(conv.id)
     setMessages(conv.messages)
     setCurrentView('chat')
+    closeSidebarOnMobile()
   }
 
   const updateCurrentConversation = (newMessages: Message[], title?: string) => {
@@ -262,6 +445,30 @@ function App() {
       }
 
       const data = await res.json()
+
+      if (Array.isArray(data.pendingAccessRequests) && data.pendingAccessRequests.length > 0) {
+        setPendingAccessRequests(prev => {
+          const byId = new Map(prev.map(p => [p.requestId, p]))
+          for (const item of data.pendingAccessRequests as PendingAccessRequest[]) {
+            if (!item?.requestId) continue
+            byId.set(item.requestId, { ...byId.get(item.requestId), ...item })
+          }
+          const next = Array.from(byId.values()).filter(p => !isTerminalAccessRequestStatus(p.status))
+          localStorage.setItem(PENDING_STORAGE_KEY, JSON.stringify(next))
+          // Restore server-side action context for fulfillment after restarts
+          for (const item of next) {
+            if (item.action?.type) {
+              fetch(`${API_BASE}/api/agent/access-request/${encodeURIComponent(item.requestId)}/context`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: item.action, description: item.description }),
+              }).catch(() => {})
+            }
+          }
+          return next
+        })
+      }
       
       const assistantMessage: Message = {
         id: 'a-' + Date.now(),
@@ -353,7 +560,7 @@ function App() {
   const renderMessage = (msg: Message) => {
     const isUser = msg.role === 'user'
     return (
-      <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-5 group`}>
+      <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-6 group`}>
         <div className={`message-bubble ${isUser ? 'user-message' : 'assistant-message'}`}>
           <div className="prose prose-invert prose-sm max-w-none">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -382,42 +589,47 @@ function App() {
       <Toaster position="top-center" richColors closeButton />
 
       {/* Top Header */}
-      <header className="portal-header flex items-center justify-between px-7 z-50">
-        <div className="flex items-center gap-4">
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="p-1.5 rounded hover:bg-[#27272a] text-[#a1a1aa]"
-          >
-            {sidebarOpen ? <ChevronLeft size={18} /> : <ChevronRight size={18} />}
-          </button>
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded bg-[#f97316] flex items-center justify-center text-black font-bold text-lg">SD</div>
+      <header className="portal-header flex items-center justify-between px-4 sm:px-6 lg:px-8 z-50">
+        <div className="header-left">
+          {authStatus === 'authenticated' && (
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="p-2 rounded-lg hover:bg-[#27272a] text-[#a1a1aa] transition-colors shrink-0"
+              aria-label={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            >
+              {sidebarOpen ? <ChevronLeft size={18} /> : <ChevronRight size={18} />}
+            </button>
+          )}
+          <div className="header-brand">
+            <div className="w-9 h-9 rounded-lg bg-[#f97316] flex items-center justify-center text-black font-bold text-lg shadow-sm shrink-0">SD</div>
             <div>
               <div className="logo text-xl tracking-tight">Super Duper Admin Portal</div>
-              <div className="text-[10px] text-[#a1a1aa] -mt-1">sledai.oktapreview.com</div>
+              <div className="text-[11px] text-[#a1a1aa] mt-0.5 leading-snug">sledai.oktapreview.com</div>
             </div>
           </div>
-          <div className="ml-4 px-2.5 py-0.5 text-xs rounded-full bg-[#27272a] border border-[#3f3f46] flex items-center gap-1.5">
-            <div className="status-dot" />
-            <span className="text-[#22c55e] text-xs font-medium">CONNECTED</span>
-          </div>
+          {authStatus === 'authenticated' && (
+            <div className="header-status">
+              <div className="status-dot" />
+              <span className="text-[#22c55e] text-xs font-medium">CONNECTED</span>
+            </div>
+          )}
         </div>
 
         {authStatus === 'authenticated' && (
-          <div className="flex items-center gap-4 text-sm">
-            <div className="text-right">
+          <div className="header-right text-sm">
+            <div className="header-user-block">
               <div className="font-medium">{currentUser.name}</div>
-              <div className="text-[11px] text-[#a1a1aa]">{currentUser.role}</div>
+              <div className="text-[11px] text-[#a1a1aa] mt-0.5">{currentUser.role}</div>
             </div>
-            <div className="w-8 h-8 rounded-full bg-[#f97316]/20 flex items-center justify-center text-[#f97316]">
+            <div className="header-divider" />
+            <div className="w-9 h-9 rounded-full bg-[#f97316]/15 border border-[#f97316]/20 flex items-center justify-center text-[#f97316] shrink-0">
               <User size={16} />
             </div>
             <button
               onClick={() => {
-                // Proper logout: call backend to destroy session, then go to root (splash)
-                window.location.href = `${API_BASE}/api/saml/logout`
+                window.location.href = `${API_BASE}/api/logout`
               }}
-              className="p-2 text-[#a1a1aa] hover:text-white"
+              className="p-2.5 rounded-lg text-[#a1a1aa] hover:text-white hover:bg-[#27272a] transition-colors shrink-0"
               title="Log out"
             >
               <LogOut size={17} />
@@ -428,38 +640,41 @@ function App() {
 
       {/* Loading state */}
       {authStatus === 'loading' && (
-        <div className="flex items-center justify-center min-h-[calc(100vh-64px)] bg-[#0f0f12]">
+        <div className="flex items-center justify-center min-h-[calc(100vh-68px)] bg-[#0f0f12]">
           <div className="text-[#a1a1aa]">Loading...</div>
         </div>
       )}
 
       {/* Splash page for unauthenticated users (SP-initiated flow) */}
       {authStatus === 'unauthenticated' && (
-        <div className="flex flex-col items-center justify-center min-h-[calc(100vh-64px)] bg-[#0f0f12] text-center p-8">
-          <div className="max-w-md">
-            <div className="flex items-center justify-center gap-3 mb-6">
-              <div className="w-12 h-12 rounded bg-[#f97316] flex items-center justify-center text-black font-bold text-3xl">SD</div>
+        <div className="flex flex-col items-center justify-center min-h-[calc(100vh-68px)] bg-[#0f0f12] text-center px-8 py-16">
+          <div className="max-w-md w-full">
+            <div className="flex items-center justify-center gap-4 mb-10">
+              <div className="w-14 h-14 rounded-xl bg-[#f97316] flex items-center justify-center text-black font-bold text-3xl shadow-md">SD</div>
               <div className="text-left">
-                <div className="text-3xl font-semibold tracking-tight">Super Duper Admin Portal</div>
-                <div className="text-sm text-[#a1a1aa]">sledai.oktapreview.com</div>
+                <div className="text-3xl font-semibold tracking-tight leading-tight">Super Duper Admin Portal</div>
+                <div className="text-sm text-[#a1a1aa] mt-1">sledai.oktapreview.com</div>
               </div>
             </div>
 
-            <h1 className="text-2xl font-semibold mb-3">Welcome, Okta Admin</h1>
-            <p className="text-[#a1a1aa] mb-8">
+            <h1 className="text-2xl font-semibold mb-4 tracking-tight">Welcome, Okta Admin</h1>
+            <p className="text-[#a1a1aa] mb-10 leading-relaxed">
               This portal is restricted to authorized administrators of the sledai.oktapreview.com organization.
             </p>
 
-            <button
-              onClick={() => {
-                window.location.href = `${API_BASE}/api/saml/login`
-              }}
-              className="mx-auto block max-w-xs w-full py-3.5 rounded-2xl bg-[#f97316] hover:bg-[#ea580c] active:bg-[#c2410c] text-white text-base font-semibold transition-all flex items-center justify-center gap-2 shadow-sm hover:shadow-md"
-            >
-              <User size={18} /> Sign in with Okta
-            </button>
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={() => {
+                  window.location.href = `${API_BASE}/api/oidc/login`
+                }}
+                className="sign-in-btn"
+              >
+                <User size={18} /> Sign in with Okta
+              </button>
+            </div>
 
-            <p className="text-[11px] text-[#71717a] mt-6">
+            <p className="text-[11px] text-[#71717a] mt-8">
               You will be redirected to Okta to authenticate.
             </p>
           </div>
@@ -468,31 +683,39 @@ function App() {
 
       {/* Main authenticated app */}
       {authStatus !== 'unauthenticated' && (
-      <div className="flex flex-1 overflow-hidden p-5 gap-5">
+      <div className="flex flex-1 overflow-hidden px-3 py-3 gap-3 sm:px-6 sm:py-5 sm:gap-6">
+        {/* Mobile drawer backdrop */}
+        {sidebarOpen && (
+          <div
+            className="sidebar-backdrop"
+            onClick={() => setSidebarOpen(false)}
+            aria-hidden="true"
+          />
+        )}
         {/* Sidebar */}
         {sidebarOpen && (
-          <div className="sidebar w-72 flex-shrink-0 flex flex-col overflow-hidden rounded-2xl">
+          <div className="sidebar w-80 flex-shrink-0 flex flex-col overflow-hidden">
             {/* New Chat */}
-            <div className="pb-3 mb-1 border-b border-[#3f3f46]/60">
+            <div className="pb-4 mb-3 border-b border-[#3f3f46]/50">
               <button
                 onClick={createNewChat}
-                className="btn-primary w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm"
+                className="btn-primary w-full flex items-center justify-center gap-2 py-3 rounded-xl text-sm"
               >
                 <Plus size={16} /> New Chat
               </button>
             </div>
 
             {/* Conversations */}
-            <div className="flex-1 overflow-y-auto py-2 text-sm">
-              <div className="px-2 pb-1.5 text-[10px] uppercase tracking-widest text-[#71717a] font-semibold">Conversations</div>
+            <div className="flex-1 overflow-y-auto py-1 text-sm min-h-0">
+              <div className="sidebar-section-label">Conversations</div>
               {conversations.length === 0 && (
-                <div className="text-[#71717a] text-xs px-3 py-2">No conversations yet</div>
+                <div className="text-[#71717a] text-xs px-3 py-3">No conversations yet</div>
               )}
               {conversations.map(conv => (
                 <div
                   key={conv.id}
                   onClick={() => switchConversation(conv)}
-                  className={`sidebar-item flex items-center justify-between gap-2 px-3 py-2.5 rounded-xl cursor-pointer mb-1 text-sm ${currentConvId === conv.id ? 'active' : ''}`}
+                  className={`sidebar-item flex items-center justify-between gap-2 px-3 py-3 cursor-pointer mb-1.5 text-sm ${currentConvId === conv.id ? 'active' : ''}`}
                 >
                   <div className="truncate pr-2 flex items-center gap-2">
                     <MessageSquare size={15} className="shrink-0" />
@@ -506,35 +729,36 @@ function App() {
             </div>
 
             {/* Nav */}
-            <div className="border-t border-[#3f3f46]/60 pt-2 mt-1 text-sm space-y-1">
+            <div className="border-t border-[#3f3f46]/50 pt-4 mt-3 text-sm space-y-1.5">
+              <div className="sidebar-section-label mb-2">Navigation</div>
               <div
-                onClick={() => setCurrentView('chat')}
-                className={`sidebar-item flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer ${currentView === 'chat' ? 'active' : ''}`}
+                onClick={() => { setCurrentView('chat'); closeSidebarOnMobile() }}
+                className={`sidebar-item flex items-center gap-3 px-3 py-3 cursor-pointer ${currentView === 'chat' ? 'active' : ''}`}
               >
                 <MessageSquare size={16} /> Chat
               </div>
               <div
-                onClick={() => setCurrentView('actions')}
-                className={`sidebar-item flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer ${currentView === 'actions' ? 'active' : ''}`}
+                onClick={() => { setCurrentView('actions'); closeSidebarOnMobile() }}
+                className={`sidebar-item flex items-center gap-3 px-3 py-3 cursor-pointer ${currentView === 'actions' ? 'active' : ''}`}
               >
                 <Zap size={16} /> Quick Actions
               </div>
               <div
-                onClick={() => { setCurrentView('users'); toast('Users view coming soon – uses /api/okta/users') }}
-                className={`sidebar-item flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer ${currentView === 'users' ? 'active' : ''}`}
+                onClick={() => { setCurrentView('users'); toast('Users view coming soon – uses /api/okta/users'); closeSidebarOnMobile() }}
+                className={`sidebar-item flex items-center gap-3 px-3 py-3 cursor-pointer ${currentView === 'users' ? 'active' : ''}`}
               >
                 <User size={16} /> Users &amp; Groups
               </div>
               <div
-                onClick={() => setCurrentView('settings')}
-                className={`sidebar-item flex items-center gap-2.5 px-3 py-2.5 rounded-xl cursor-pointer ${currentView === 'settings' ? 'active' : ''}`}
+                onClick={() => { setCurrentView('settings'); closeSidebarOnMobile() }}
+                className={`sidebar-item flex items-center gap-3 px-3 py-3 cursor-pointer ${currentView === 'settings' ? 'active' : ''}`}
               >
                 <Settings size={16} /> Settings
               </div>
             </div>
 
-            <div className="pt-3 mt-1 text-[10px] text-[#71717a] border-t border-[#3f3f46]/60">
-              Demo • SAML + Okta Workflows ready
+            <div className="pt-4 mt-3 text-[10px] text-[#71717a] leading-relaxed border-t border-[#3f3f46]/50">
+              Demo • OIDC + Okta Workflows ready
             </div>
           </div>
         )}
@@ -543,18 +767,18 @@ function App() {
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Chat View */}
           {currentView === 'chat' && (
-            <div className="chat-container flex-1 flex flex-col rounded-2xl overflow-hidden">
+            <div className="chat-container flex-1 flex flex-col overflow-hidden">
               {/* Chat header / model picker */}
-              <div className="flex items-center justify-between px-6 py-4 border-b border-[#3f3f46]/60 bg-[#18181b]">
+              <div className="panel-header">
                 <div>
-                  <div className="font-semibold">Okta Admin Assistant</div>
-                  <div className="text-xs text-[#a1a1aa] mt-0.5">sledai.oktapreview.com • Responses may be logged for audit</div>
+                  <div className="panel-header-title">Okta Admin Assistant</div>
+                  <div className="panel-header-subtitle">sledai.oktapreview.com • Responses may be logged for audit</div>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 shrink-0">
                   <select
                     value={selectedModel}
                     onChange={(e) => setSelectedModel(e.target.value)}
-                    className="model-select rounded-xl px-3.5 py-2 text-sm focus:outline-none"
+                    className="model-select rounded-xl px-4 py-2.5 text-sm focus:outline-none"
                     disabled={availableModels.length === 0}
                   >
                     {availableModels.length === 0 ? (
@@ -565,7 +789,7 @@ function App() {
                       ))
                     )}
                   </select>
-                  <button onClick={createNewChat} className="btn-secondary flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-sm">
+                  <button onClick={createNewChat} className="btn-secondary flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm">
                     <Plus size={15} /> New
                   </button>
                 </div>
@@ -573,62 +797,96 @@ function App() {
 
               {/* Messages */}
               <div className="messages-area">
-                {messages.length === 0 && (
-                  <div className="max-w-2xl mx-auto mt-12 text-center">
-                    <div className="text-6xl mb-5">👋</div>
-                    <h2 className="text-2xl font-semibold mb-2.5">Ready when you are</h2>
-                    <p className="text-[#a1a1aa] mb-8">Ask anything about your Okta environment or use a suggested prompt below.</p>
+                <div className="messages-inner">
+                  {messages.length === 0 && (
+                    <div className="empty-state">
+                      <div className="empty-state-icon"><Shield size={28} /></div>
+                      <h2>Ready when you are</h2>
+                      <p>Ask anything about your Okta environment or use a suggested prompt below.</p>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-xl mx-auto">
-                      {SUGGESTED_PROMPTS.map((p, i) => (
-                        <button
-                          key={i}
-                          onClick={() => handleSuggestedPrompt(p)}
-                          className="prompt-chip text-left px-4 py-3.5 rounded-2xl"
-                        >
-                          {p}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {messages.map(renderMessage)}
-
-                {isLoading && (
-                  <div className="flex justify-start mb-4">
-                    <div className="assistant-message">
-                      <div className="typing-indicator">
-                        <span></span><span></span><span></span>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        {SUGGESTED_PROMPTS.map((p, i) => (
+                          <button
+                            key={i}
+                            onClick={() => handleSuggestedPrompt(p)}
+                            className="prompt-chip text-left px-5 py-4 rounded-2xl"
+                          >
+                            {p}
+                          </button>
+                        ))}
                       </div>
                     </div>
-                  </div>
-                )}
-                <div ref={messagesEndRef} />
+                  )}
+
+                  {messages.map(renderMessage)}
+
+                  {isLoading && (
+                    <div className="flex justify-start mb-6">
+                      <div className="assistant-message">
+                        <div className="typing-indicator">
+                          <span></span><span></span><span></span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
               </div>
+
+              {needsReauth && (
+                <div className="reauth-banner">
+                  <div className="messages-inner flex flex-wrap items-center justify-between gap-3 text-sm">
+                    <span>
+                      Your Okta token expired (~1 hour). Agent tools (secrets, delegated API) need a fresh sign-in.
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-primary px-4 py-2 rounded-xl text-sm shrink-0"
+                      onClick={() => { window.location.href = `${API_BASE}/api/oidc/login` }}
+                    >
+                      Sign in again
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {pendingAccessRequests.some(p => !isTerminalAccessRequestStatus(p.status)) && (
+                <div className="access-request-poll-banner">
+                  <div className="messages-inner flex items-center gap-2 text-sm">
+                    <Shield size={15} className="shrink-0 text-[#f97316]" />
+                    <span>
+                      Waiting for Okta approval:{' '}
+                      {pendingAccessRequests
+                        .filter(p => !isTerminalAccessRequestStatus(p.status))
+                        .map(p => `${p.requestId.slice(0, 8)}… (${accessRequestStatusLabel(p.status)})`)
+                        .join(' · ')}
+                    </span>
+                  </div>
+                </div>
+              )}
 
               {/* Input */}
               <div className="input-area">
-                <div className="max-w-4xl mx-auto flex gap-2 items-end">
+                <div className="messages-inner flex gap-3 items-end">
                   <textarea
                     ref={inputRef}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
                     placeholder="Ask about users, policies, sign-ins, or request an admin action..."
-                    className="chat-input flex-1 rounded-2xl px-5 py-3.5 min-h-[52px] max-h-36"
+                    className="chat-input flex-1 rounded-2xl px-5 py-4 min-h-[56px] max-h-36"
                     rows={1}
                     disabled={isLoading}
                   />
                   <button
                     onClick={handleSend}
                     disabled={!input.trim() || isLoading}
-                    className="btn-primary h-[52px] w-[52px] rounded-2xl flex items-center justify-center disabled:opacity-50"
+                    className="btn-primary h-[56px] w-[56px] rounded-2xl flex items-center justify-center disabled:opacity-50 shrink-0"
                   >
                     <Send size={19} />
                   </button>
                 </div>
-                <div className="text-center text-[10px] text-[#71717a] mt-2">
+                <div className="text-center text-[11px] text-[#71717a] mt-3">
                   All destructive actions require Okta workflow approval • Conversations saved locally
                 </div>
               </div>
@@ -637,65 +895,80 @@ function App() {
 
           {/* Quick Actions View */}
           {currentView === 'actions' && (
-            <div className="p-10 max-w-4xl mx-auto w-full overflow-y-auto">
-              <h1 className="text-2xl font-semibold mb-1.5">Quick Actions</h1>
-              <p className="text-[#a1a1aa] mb-8">These trigger backend REST calls. Destructive ones initiate Okta approval workflows.</p>
+            <div className="content-panel flex-1 overflow-hidden">
+              <div className="content-panel-body">
+                <div className="max-w-4xl mx-auto w-full">
+                  <h1 className="text-2xl font-semibold mb-2 tracking-tight">Quick Actions</h1>
+                  <p className="text-[#a1a1aa] mb-10 leading-relaxed">These trigger backend REST calls. Destructive ones initiate Okta approval workflows.</p>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                {QUICK_ACTIONS.map(action => {
-                  const Icon = action.icon
-                  return (
-                    <button
-                      key={action.id}
-                      onClick={() => handleQuickAction(action.id)}
-                      className={`action-card text-left rounded-2xl flex gap-4 ${action.danger ? 'danger' : ''}`}
-                    >
-                      <div className={`mt-0.5 ${action.danger ? 'text-[#ef4444]' : 'text-[#f97316]'}`}>
-                        <Icon size={26} />
-                      </div>
-                      <div>
-                        <div className="font-semibold text-lg">{action.label}</div>
-                        <div className="text-[#a1a1aa] text-sm mt-1">{action.desc}</div>
-                        <div className="mt-4 text-xs text-[#f97316] font-medium tracking-wide">EXECUTE →</div>
-                      </div>
-                    </button>
-                  )
-                })}
-              </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    {QUICK_ACTIONS.map(action => {
+                      const Icon = action.icon
+                      return (
+                        <button
+                          key={action.id}
+                          onClick={() => handleQuickAction(action.id)}
+                          className={`action-card text-left flex gap-5 ${action.danger ? 'danger' : ''}`}
+                        >
+                          <div className={`mt-1 shrink-0 ${action.danger ? 'text-[#ef4444]' : 'text-[#f97316]'}`}>
+                            <Icon size={24} />
+                          </div>
+                          <div>
+                            <div className="font-semibold text-base tracking-tight">{action.label}</div>
+                            <div className="text-[#a1a1aa] text-sm mt-2 leading-relaxed">{action.desc}</div>
+                            <div className="mt-5 text-xs text-[#f97316] font-medium tracking-wide">EXECUTE →</div>
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
 
-              <div className="mt-8 p-5 rounded-2xl bg-[#18181b] border border-[#3f3f46]/60 text-sm leading-relaxed">
-                <strong>Production note:</strong> These endpoints will POST to your Okta Workflows or custom approval system. The chat assistant can also trigger them via function calling once the MCP + LLM tools are connected.
+                  <div className="mt-10 info-card text-sm leading-relaxed">
+                    <strong>Production note:</strong> These endpoints will POST to your Okta Workflows or custom approval system. The chat assistant can also trigger them via function calling once the MCP + LLM tools are connected.
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
           {/* Users placeholder */}
           {currentView === 'users' && (
-            <div className="p-10 max-w-3xl mx-auto text-center flex flex-col items-center justify-center h-full">
-              <User size={48} className="mx-auto mb-5 opacity-60" />
-              <h2 className="text-xl font-semibold">Users &amp; Groups</h2>
-              <p className="text-[#a1a1aa] mt-2.5 max-w-md leading-relaxed">This tab will list users via <code className="text-[#f97316]">GET /api/okta/users</code> and support bulk actions. Coming in next iteration.</p>
-              <button onClick={() => setCurrentView('chat')} className="btn-secondary mt-7 px-6 py-2.5 rounded-xl">Back to Chat</button>
+            <div className="content-panel flex-1 overflow-hidden">
+              <div className="content-panel-body flex flex-col items-center justify-center text-center">
+                <div className="max-w-md">
+                  <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-[#27272a] border border-[#3f3f46]/50 flex items-center justify-center">
+                    <User size={32} className="text-[#f97316] opacity-80" />
+                  </div>
+                  <h2 className="text-xl font-semibold tracking-tight">Users &amp; Groups</h2>
+                  <p className="text-[#a1a1aa] mt-4 leading-relaxed">This tab will list users via <code className="text-[#f97316] bg-[#27272a] px-1.5 py-0.5 rounded">GET /api/okta/users</code> and support bulk actions. Coming in next iteration.</p>
+                  <button onClick={() => setCurrentView('chat')} className="btn-secondary mt-8 px-6 py-3 rounded-xl">Back to Chat</button>
+                </div>
+              </div>
             </div>
           )}
 
           {/* Settings */}
           {currentView === 'settings' && (
-            <div className="p-10 max-w-2xl mx-auto w-full overflow-y-auto">
-              <h1 className="text-2xl font-semibold mb-6">Settings</h1>
-              <div className="space-y-4 text-sm">
-                <div className="p-5 bg-[#18181b] rounded-2xl border border-[#3f3f46]/60">
-                  <div className="font-medium mb-1.5">Authentication Mode</div>
-                  <div className="text-[#a1a1aa]">Currently: <span className="text-[#f97316]">DEMO_AUTH_BYPASS</span> (SAML coming)</div>
-                  <div className="text-xs mt-2.5 leading-relaxed">When SAML is enabled in Okta, users will launch this app from the dashboard and JIT into full admin rights here.</div>
-                </div>
-                <div className="p-5 bg-[#18181b] rounded-2xl border border-[#3f3f46]/60">
-                  <div className="font-medium mb-1.5">LLM Configuration</div>
-                  <div className="text-[#a1a1aa] leading-relaxed">Keys are loaded server-side from <code>.env</code>. Add OPENAI_API_KEY etc. then restart api process.</div>
-                </div>
-                <div className="p-5 bg-[#18181b] rounded-2xl border border-[#3f3f46]/60">
-                  <div className="font-medium mb-1.5">MCP Server</div>
-                  <div className="text-[#a1a1aa] leading-relaxed">A Model Context Protocol server will expose these chat + action tools to agents (Claude Desktop, etc).</div>
+            <div className="content-panel flex-1 overflow-hidden">
+              <div className="content-panel-body">
+                <div className="max-w-2xl mx-auto w-full">
+                  <h1 className="text-2xl font-semibold mb-2 tracking-tight">Settings</h1>
+                  <p className="text-[#a1a1aa] mb-8 leading-relaxed">Portal configuration and integration details.</p>
+                  <div className="space-y-5 text-sm">
+                    <div className="info-card">
+                      <div className="font-medium mb-2 text-base">Authentication Mode</div>
+                      <div className="text-[#a1a1aa]">Currently: <span className="text-[#f97316]">OIDC (private_key_jwt)</span></div>
+                      <div className="text-xs mt-3 leading-relaxed text-[#a1a1aa]">Users launch this app from the Okta dashboard, sign in via OIDC, and the agent acts on their behalf (human ∩ agent scopes) through Cross App Access.</div>
+                    </div>
+                    <div className="info-card">
+                      <div className="font-medium mb-2 text-base">LLM Configuration</div>
+                      <div className="text-[#a1a1aa] leading-relaxed">Keys are loaded server-side from <code className="text-[#f97316] bg-[#1f1f23] px-1.5 py-0.5 rounded">.env</code>. Add OPENAI_API_KEY etc. then restart api process.</div>
+                    </div>
+                    <div className="info-card">
+                      <div className="font-medium mb-2 text-base">MCP Server</div>
+                      <div className="text-[#a1a1aa] leading-relaxed">A Model Context Protocol server will expose these chat + action tools to agents (Claude Desktop, etc).</div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>

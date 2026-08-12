@@ -24,6 +24,9 @@ secrets/
 *.pem
 *.key
 
+# Runtime state (sessions, access-request cache)
+.data/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -34,3 +37,8 @@ secrets/
 *.njsproj
 *.sln
 *.sw?
+
+# Local backups / scratch (never publish)
+backups/
+*.bak.*
+XAI.md

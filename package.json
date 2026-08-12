@@ -36,6 +36,7 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "samlify": "^2.13.1",
+    "session-file-store": "^1.5.0",
     "sonner": "^2.0.7"
   },
   "devDependencies": {
