@@ -1,18 +1,19 @@
 # Super Duper Admin Portal
 
-**Chat-first admin interface for Okta administrators on sledai.oktapreview.com**
+> 🤖 **Setting this up with an AI coding agent?** Point it at [README-AGENT.md](README-AGENT.md) — a phased, verification-driven runbook written for agents.
+
+**Chat-first admin interface for Okta administrators** (example org: `sledai.oktapreview.com` — substitute your own)
 
 Dark theme with orange accent. Built for demo / internal use. Chat with LLMs that understand your Okta org, trigger safe admin actions (via approval workflows), and expose everything via REST + MCP.
 
-## Ports (Important on this machine)
+## Ports
 
-This host already has **many** services running. We have deliberately chosen:
+Defaults:
 
 - **Web (SPA)**: `3200`
 - **API**: `3201`
 
-These ports were confirmed free when the project was set up.  
-If they ever become conflicted, just change `PORT` and `API_PORT` in `.env.local` (and restart).
+If these conflict with other services on your host, just change `PORT` and `API_PORT` in `.env.local` (and restart).
 
 All internal calls from the frontend use relative URLs (`/api/...`), so no other code changes are needed when you change ports.
 
@@ -29,7 +30,7 @@ All internal calls from the frontend use relative URLs (`/api/...`), so no other
 ## Quick Start
 
 ```bash
-cd ~/oktaAdminApp
+cd super-duper-admin-portal
 
 # 1. Configure environment
 cp .env.example .env.local
@@ -40,7 +41,7 @@ npm install
 
 # 3. Development (two terminals or use the helper)
 npm run dev          # Vite frontend on 5173
-npm run dev:api      # API on 3001
+npm run dev:api      # API on 3201 (API_PORT)
 
 # Or everything together:
 npm run dev:full
@@ -140,8 +141,8 @@ Point it at an Okta Workflow (or any HTTPS endpoint) that:
   "mcpServers": {
     "sdap": {
       "command": "node",
-      "args": ["/home/skylar/oktaAdminApp/mcp-server/index.js"],
-      "cwd": "/home/skylar/oktaAdminApp"
+      "args": ["/path/to/super-duper-admin-portal/mcp-server/index.js"],
+      "cwd": "/path/to/super-duper-admin-portal"
     }
   }
 }

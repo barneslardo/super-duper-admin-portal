@@ -41,7 +41,7 @@ module.exports = {
         ...process.env,
         ...fileEnv,
         NODE_ENV: "production",
-        // Tailscale DNS SERVFAILs for Okta etc.; bootstrap uses 1.1.1.1/8.8.8.8 (override via DNS_SERVERS).
+        // Some host resolvers SERVFAIL for Okta etc.; bootstrap uses 1.1.1.1/8.8.8.8 (override via DNS_SERVERS).
         NODE_OPTIONS: "--import=./lib/dnsBootstrap.js",
       },
       instances: 1,
