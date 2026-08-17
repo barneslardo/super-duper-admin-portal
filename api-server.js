@@ -19,6 +19,7 @@ import { AccessRequestStore } from './lib/accessRequestStore.js'
 import { dataDir } from './lib/dataDir.js'
 import { ensureSessionIdToken, idTokenExpiresAt, sessionIdTokenStatus } from './lib/sessionIdToken.js'
 import fileStoreFactory from 'session-file-store'
+import { mountMcpRoutes } from './lib/mcpHttp.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -1144,6 +1145,9 @@ app.all(/^\/api\/agent\/okta\/.*/, requireAuth, async (req, res) => {
     res.status(502).json({ error: 'Failed to reach Okta', detail: e.message })
   }
 })
+
+// OAuth-protected HTTP MCP endpoint (registrable in Okta MCP Servers)
+mountMcpRoutes(app)
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ SDAP API server running on http://0.0.0.0:${PORT}`)
