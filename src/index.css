@@ -212,6 +212,8 @@ body {
 .messages-area {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
+  position: relative; /* message offsetTop is measured against this box */
   padding: var(--sdap-space-2xl) var(--sdap-space-xl);
   scroll-behavior: smooth;
 }
@@ -224,6 +226,8 @@ body {
 
 .message-bubble {
   max-width: 78%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   padding: 0.875rem 1.125rem;
   border-radius: var(--sdap-radius-lg);
   position: relative;
@@ -257,6 +261,25 @@ body {
 }
 
 .message-bubble .prose p { margin-top: 0.5em; margin-bottom: 0.5em; }
+.message-bubble .prose table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.chat-error-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 1.5rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--sdap-radius-md);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
 .message-bubble .prose p:first-child { margin-top: 0; }
 .message-bubble .prose p:last-child { margin-bottom: 0; }
 

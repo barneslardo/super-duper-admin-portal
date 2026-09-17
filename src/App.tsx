@@ -216,8 +216,11 @@ function App() {
     return () => window.clearInterval(timer)
   }, [authStatus, API_BASE])
 
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesAreaRef = useRef<HTMLDivElement>(null)
+  const lastUserRef = useRef<HTMLDivElement>(null)
+  const spacerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const [chatError, setChatError] = useState<string | null>(null)
 
   useEffect(() => {
     pendingAccessRequestsRef.current = pendingAccessRequests
@@ -356,10 +359,25 @@ function App() {
     }
   }, [conversations])
 
-  // Auto scroll to bottom
+  // Keep the latest question at the top of the messages area so the answer
+  // reads downward from it, instead of dropping the reader at the bottom of a
+  // long reply. The spacer lets a short reply sit directly under its question.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, isLoading])
+    const area = messagesAreaRef.current
+    const anchor = lastUserRef.current
+    if (!area) return
+    if (!anchor) {
+      area.scrollTo({ top: area.scrollHeight, behavior: 'smooth' })
+      return
+    }
+    const spacer = spacerRef.current
+    if (spacer) {
+      spacer.style.height = '0px'
+      const tail = area.scrollHeight - anchor.offsetTop
+      spacer.style.height = `${Math.max(0, area.clientHeight - tail - 16)}px`
+    }
+    area.scrollTo({ top: Math.max(0, anchor.offsetTop - 16), behavior: 'smooth' })
+  }, [messages, isLoading, chatError, currentView])
 
   // Get current conversation (used for title updates etc.)
   // const currentConv = conversations.find(c => c.id === currentConvId)
@@ -420,6 +438,7 @@ function App() {
     const newMessages = [...messages, userMessage]
     setMessages(newMessages)
     setInput('')
+    setChatError(null)
     setIsLoading(true)
 
     // Update conv immediately
@@ -483,15 +502,9 @@ function App() {
 
     } catch (error: any) {
       console.error('Chat error:', error)
-      const errorMsg: Message = {
-        id: 'err-' + Date.now(),
-        role: 'assistant',
-        content: `**Error:** ${error.message}`,
-        timestamp: new Date(),
-      }
-      const finalMessages = [...newMessages, errorMsg]
-      setMessages(finalMessages)
-      updateCurrentConversation(finalMessages)
+      // Errors are shown as a notice, not stored as an assistant turn, so they
+      // never get replayed to the model as conversation history.
+      setChatError(error?.message || 'Chat request failed')
       toast.error('Chat request failed')
     } finally {
       setIsLoading(false)
@@ -556,11 +569,17 @@ function App() {
     }
   }
 
+  const lastUserIndex = messages.map(m => m.role).lastIndexOf('user')
+
   // Render a single message with markdown + copy
-  const renderMessage = (msg: Message) => {
+  const renderMessage = (msg: Message, index: number) => {
     const isUser = msg.role === 'user'
     return (
-      <div key={msg.id} className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-6 group`}>
+      <div
+        key={msg.id}
+        ref={isUser && index === lastUserIndex ? lastUserRef : undefined}
+        className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-6 group`}
+      >
         <div className={`message-bubble ${isUser ? 'user-message' : 'assistant-message'}`}>
           <div className="prose prose-invert prose-sm max-w-none">
             <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -796,7 +815,7 @@ function App() {
               </div>
 
               {/* Messages */}
-              <div className="messages-area">
+              <div className="messages-area" ref={messagesAreaRef}>
                 <div className="messages-inner">
                   {messages.length === 0 && (
                     <div className="empty-state">
@@ -829,7 +848,15 @@ function App() {
                       </div>
                     </div>
                   )}
-                  <div ref={messagesEndRef} />
+                  {chatError && !isLoading && (
+                    <div className="chat-error-notice" role="alert">
+                      <span>{chatError}</span>
+                      <button type="button" onClick={() => setChatError(null)} className="btn-secondary px-3 py-1.5 rounded-lg text-xs shrink-0">
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                  <div ref={spacerRef} aria-hidden="true" />
                 </div>
               </div>
 
