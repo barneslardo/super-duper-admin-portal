@@ -20,6 +20,8 @@ import { dataDir } from './lib/dataDir.js'
 import { ensureSessionIdToken, idTokenExpiresAt, sessionIdTokenStatus } from './lib/sessionIdToken.js'
 import fileStoreFactory from 'session-file-store'
 import { mountMcpRoutes } from './lib/mcpHttp.js'
+import { fetchOktaLogs, buildActivityReport, compactEvent } from './lib/agentActivity.js'
+import { directoryRoster } from './lib/directoryRoster.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -137,9 +139,8 @@ app.get('/api/health', (req, res) => {
     org: 'sledai.oktapreview.com',
     demoBypass: process.env.DEMO_AUTH_BYPASS === 'true',
     llm: {
-      openai: !!process.env.OPENAI_API_KEY,
-      anthropic: !!process.env.ANTHROPIC_API_KEY,
-      grok: !!process.env.GROK_API_KEY,
+      gateway: llmGatewayConfigured(),
+      defaultModel: resolveChatModel().id,
     },
     persistence: {
       dataDir: dataDir(),
@@ -170,40 +171,86 @@ app.get('/api/auth/me', (req, res) => {
 })
 
 // ----------------------
-// Available models (only those we have keys for). Public: the splash/UI
-// calls this before authentication to populate the model picker.
+// Chat models. Every model goes through the OpenAI-compatible LLM gateway
+// (LiteLLM), which tracks usage per demo site. gemma4 is self-hosted; grok-4.3
+// is xAI. Public: the splash/UI calls this before authentication. The entry
+// flagged `default` is CHAT_DEFAULT_MODEL, which the UI preselects.
 // ----------------------
+const CHAT_MODELS = [
+  { id: 'gemma4', label: 'Gemma 4 (self-hosted)', provider: 'litellm' },
+  { id: 'grok-4.3', label: 'Grok 4.3 (xAI)', provider: 'litellm' },
+]
+
+function llmGatewayConfigured() {
+  return Boolean(process.env.LLM_BASE_URL && process.env.LLM_API_KEY)
+}
+
+// Resolve strictly against CHAT_MODELS: an unknown model is ignored, so a
+// crafted request can't reach anything else.
+function resolveChatModel(requested) {
+  const found = CHAT_MODELS.find(m => m.id === requested)
+  if (requested && !found) {
+    console.warn(`[chat] ignoring requested model "${requested}" — allowed: ${CHAT_MODELS.map(m => m.id).join(', ')}`)
+  }
+  return found
+    ?? CHAT_MODELS.find(m => m.id === (process.env.CHAT_DEFAULT_MODEL || 'gemma4'))
+    ?? CHAT_MODELS[0]
+}
+
 app.get('/api/available-models', (req, res) => {
-  const models = []
-
-  if (process.env.OPENAI_API_KEY) {
-    models.push(
-      { id: 'gpt-4o', label: 'GPT-4o (OpenAI)', provider: 'openai' },
-      { id: 'gpt-4o-mini', label: 'GPT-4o mini (OpenAI)', provider: 'openai' }
-    )
-  }
-
-  if (process.env.GROK_API_KEY) {
-    models.push(
-      { id: 'grok-4.3', label: 'Grok 4.3 (xAI)', provider: 'grok' }
-    )
-  }
-
-  if (process.env.ANTHROPIC_API_KEY) {
-    models.push(
-      { id: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet (Anthropic)', provider: 'anthropic' },
-      { id: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku (Anthropic)', provider: 'anthropic' }
-    )
-  }
-
-  res.json(models)
+  const defaultId = resolveChatModel().id
+  res.json(llmGatewayConfigured() ? CHAT_MODELS.map(m => ({ ...m, default: m.id === defaultId })) : [])
 })
 
+// Shared XAA gate for chat tools and the activity route: valid session id_token ->
+// delegated (human ∩ agent) token -> required scope. Returns {error,...} or {ok, granted}.
+async function requireDelegatedScope(req, need) {
+  let idToken
+  try {
+    idToken = await ensureSessionIdToken(req)
+  } catch (e) {
+    return { error: e.message, reauth: e.code === 'SESSION_ID_TOKEN_EXPIRED' || e.code === 'SESSION_NO_ID_TOKEN' }
+  }
+  let delegated
+  try {
+    delegated = await getDelegatedAccessToken({ idToken })
+  } catch (e) {
+    const reauth = /subject_token|invalid.*token/i.test(e.message)
+    return {
+      error: `Token exchange failed: ${e.message}`,
+      ...(reauth ? { reauth: true, hint: 'Sign out and sign in again — your Okta id_token may have expired.' } : {}),
+    }
+  }
+  const granted = (delegated.scope || '').split(' ').filter(Boolean)
+  if (!granted.includes(need)) return { error: `Insufficient delegated scope — need ${need}, granted: ${granted.join(', ')}` }
+  return { ok: true, granted, delegated }
+}
+
+function parseActivityWindow({ hours, since, until }) {
+  const h = Math.min(168, Math.max(0.25, Number(hours) || 24))
+  const u = until ? new Date(String(until)) : new Date()
+  const s = since ? new Date(String(since)) : new Date(u.getTime() - h * 36e5)
+  if (isNaN(s) || isNaN(u) || s >= u) return { error: 'Invalid window — since must be before until (ISO-8601, e.g. 2026-09-17T00:00:00Z).' }
+  return { since: s.toISOString(), until: u.toISOString() }
+}
+
+async function runActivityReport({ since, until, detail, user }) {
+  const { events, pages, truncated, coveredFrom, coveredTo } = await fetchOktaLogs({
+    oktaBase: (process.env.OKTA_ORG_URL || '').replace(/\/$/, ''),
+    token: process.env.OKTA_API_TOKEN,
+    since, until,
+  })
+  return buildActivityReport(events, { since, until, detail, user: user || null, fetched: { pages, truncated, coveredFrom, coveredTo } })
+}
+
+const oktaCfg = () => ({ oktaBase: (process.env.OKTA_ORG_URL || '').replace(/\/$/, ''), token: process.env.OKTA_API_TOKEN })
+
 // ----------------------
-// Chat proxy to the configured LLM provider
+// Chat proxy to the LLM gateway
 // ----------------------
 app.post('/api/chat', requireAuth, async (req, res) => {
-  const { messages = [], model, provider } = req.body || {}
+  // `provider` from older clients is ignored; everything goes through the gateway.
+  const { messages = [], model } = req.body || {}
 
   const sessionUser = req.session?.user || {}
 
@@ -229,6 +276,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     '       Fetches the Okta System Log on behalf of the signed-in admin. Uses the full XAA',
     '       token-exchange chain. "since" defaults to the last 24h if omitted.',
     '       Example: /api/agent/okta/logs?since=2026-05-30T00:00:00Z&limit=50',
+    '',
+    '  GET  /api/agent/okta/activity?hours=24&user=<login>&detail=brief|full',
+    '       Pre-digested activity report (same data as the tenant_activity_report tool).',
+    '  GET  /api/agent/okta/roster?group=<name|00g id>|role=SUPER_ADMIN&inactiveDays=30',
+    '       Group/role membership with lastLogin + status (same data as the directory_roster tool).',
     '',
     '  GET  /api/agent/okta/me   (alias: /api/agent/registry)',
     '       Returns this agent\'s own Okta registration: client ID, org, granted scopes, app',
@@ -270,13 +322,73 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     'data and analyse it directly. Present findings clearly: summarise what you found, call out',
     'anomalies, and flag anything suspicious.',
     '',
-    'INTERPRETING SYSTEM LOG for agent/automated activity — look for:',
-    '  • eventType "app.oauth2.token.grant.*" — token grants (esp. client_credentials, jwt-bearer)',
-    '  • debugContext.debugData.clientAuthType == "private_key_jwt" — non-human client auth',
-    '  • actor.type == "PublicClientApp" or "ServicePrincipal" — non-human actors',
-    '  • Non-browser userAgents (okta-sdk-*, curl, python-requests, etc.)',
-    '  • High-frequency token requests from the same client in a short window',
-    '  • Unusual grantTypes: token-exchange, jwt-bearer, client_credentials',
+    'ACTIVITY QUESTIONS — ALWAYS START WITH THE tenant_activity_report TOOL. For any broad or',
+    'vague question ("what\'s going on in the tenant today", "anything interesting", "who is using',
+    'agents", "what did the agents do", "show me AI/agent activity", "what ran overnight",',
+    '"summarise the last N hours", "what has <user> been doing") call tenant_activity_report FIRST',
+    '(hours=24 unless the admin said otherwise; pass user=<name or login> when they name a person).',
+    'It reads the Okta System Log AND the OPA audit (pam.* events live in the same log), classifies',
+    'every event and returns a pre-digested JSON report. Do NOT page through raw /logs for these',
+    'questions. Use fetch_okta_data only afterwards, to drill into one user, client or event type.',
+    '',
+    'DIRECTORY QUESTIONS ARE NOT LOG QUESTIONS. "Who has / has not logged in", "never logged in",',
+    '"last login", "inactive", "not activated", "who is in group X / who are the Super Admins" are',
+    'answered from the user profile (lastLogin, status) via the directory_roster tool — pass',
+    'group=<exact name or 00g… id> or role=SUPER_ADMIN (any Okta admin role). Never answer these',
+    'from a log window: absence from a 7-day report only means no events in that window. If',
+    'directory_roster returns needsClarification, list the candidate groups and ASK which one —',
+    'never pick a "closest match". "Super Admins" with no group named = role=SUPER_ADMIN.',
+    '',
+    'REPORT HONESTY: if the activity report has a non-empty warnings[] (event cap reached), state',
+    'the covered time range in your first sentence. peopleSeen lists every person with any event in',
+    'the window — check it before saying someone "did not appear". When asked about one person, call',
+    'tenant_activity_report again with user=<login> rather than reasoning from the summary.',
+    '',
+    'PRIORITY ORDER when reporting activity (highest first — lead with 1, keep 5 to one sentence):',
+    '  1. humanDrivenAgentActivity + chainsByHuman — an AI agent acting FOR a human: XAA / ID-JAG',
+    '     delegation, CIBA push approvals, token-exchange, Okta Agent Gateway MCP tool calls,',
+    '     agent-created access requests, plus that human\'s OPA server access (creds issued / SSH).',
+    '  2. anomalies — failures, HIGH risk, unknown clients, denied exchanges.',
+    '  3. autonomousWorkloads — non-human identities minting their own tokens (client_credentials /',
+    '     jwt-bearer) with no human in the loop. One line per principal with the count.',
+    '  4. privilegedHumanActivity — lifecycle / policy / secret-reveal changes made by admins.',
+    '  5. routineSignIns — ordinary SSO / MFA logins. Give the total in ONE sentence, never a list.',
+    '  6. oktaInfrastructure — AD Agent, OPS Agent, OPA/IGA connectors, imports. Only if asked.',
+    '',
+    'HOW TO NARRATE A CHAIN: walk chainsByHuman[].timeline in time order and name the human, the',
+    'agent, the mechanism (XAA/ID-JAG, CIBA, token-exchange, Agent Gateway), the scopes and the',
+    'source IP, quoting timestamps as given. Example: "Skylar Barnes was issued OPA credentials for',
+    'claude-home (MFA ok) at 21:32Z; Claude Code CIBA then obtained a token for Skylar via CIBA',
+    '(approved on the phone) with scopes mcp.access mcp.write; Agent Claude-CLI-EC2 then called an',
+    'MCP tool through the Agent Gateway." A "×N" suffix means the same step repeated N times.',
+    'When asked to "walk me through" / "what did <user> do": reproduce that person\'s',
+    'chainsByHuman[].timeline as a numbered list in time order (one step per line, keep the',
+    'timestamps), then add one or two sentences of interpretation. Do not regroup it by category.',
+    'Wording rules: OPA always means Okta Privileged Access (never "open source"); "workload token"',
+    'means a token minted by a non-human identity; refer to people by name (no assumed pronouns);',
+    'never invent numbers — every count you state must appear in the tool result.',
+    '',
+    'IDENTIFYING AGENTS vs HUMANS vs INFRASTRUCTURE in raw events (for drill-downs):',
+    '  • actor.type "Agent" or actor.detailEntry.subjectProfile "ai_agent" = registered Okta AI agent',
+    '  • target type "id_jag" / eventType app.oauth2.token.grant.id_jag = XAA delegation (agent FOR user)',
+    '  • debugData.grantType urn:openid:params:grant-type:ciba = CIBA (human approved on their phone)',
+    '  • debugData.grantType …grant-type:token-exchange = on-behalf-of exchange',
+    '  • eventType agent_gateway.* = Okta Agent Gateway MCP tool calls (actor is the agent)',
+    '  • device.custom_push.send_notification with requestUri /bc/authorize = CIBA approval push',
+    '  • pam.* = OPA audit: pam.user_creds.issue (server creds, debugData.serverHostnames),',
+    '    pam.server.ssh_login (target Server), pam.secret.reveal, pam.auth_token.issue',
+    '  • "Active Directory Agent", "OPS Agent", "Okta Privileged Access Connector", "Okta IGA',
+    '    Connector" are Okta infrastructure — NEVER call them AI agents. system.agent.ad.* = AD agent.',
+    '  • client_credentials / jwt-bearer with no User target = autonomous workload identity',
+    '',
+    'RAW LOG FILTERS for fetch_okta_data (copy exactly; combine clauses with " and " / " or "):',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=actor.type eq "Agent"',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=eventType eq "app.oauth2.token.grant.id_jag"',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=debugContext.debugData.grantType eq "urn:openid:params:grant-type:ciba"',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=eventType sw "pam."',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=eventType sw "agent_gateway."',
+    '  /logs?since=<ISO>&sortOrder=DESCENDING&limit=100&filter=actor.alternateId eq "<login>" or target.alternateId eq "<login>"',
+    '  /logs results come back compacted: one object per event with a ready-made "summary" line.',
     '',
     'PRIVILEGED ACTIONS — when the admin asks you to perform a DESTRUCTIVE action (suspend/unsuspend/activate/deactivate',
     'or deactivate a user, reset MFA, delete something, change a sign-on/policy rule) OR a CREATIVE',
@@ -316,7 +428,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     ...messages
   ]
 
-  // Tool definition — shared across providers (adapted per API format below)
+  // Tool definition — sent to the LLM gateway in OpenAI function-calling shape
   const OKTA_TOOL = {
     name: 'fetch_okta_data',
     description: [
@@ -449,8 +561,61 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     },
   }
 
-  // All tools, in the shapes the three provider APIs expect.
-  const ALL_TOOLS = [OKTA_TOOL, ACCESS_REQUEST_TOOL, ACCESS_REQUEST_STATUS_TOOL, SECRET_TOOL]
+  // Pre-digested activity report — the deterministic path for "what's going on" questions so a
+  // small model never has to compose Okta filters or read hundreds of raw events.
+  const ACTIVITY_TOOL = {
+    name: 'tenant_activity_report',
+    description: [
+      'FIRST CHOICE for any broad question about what is happening in the tenant ("what\'s going on',
+      'today", "who is using which agents", "what did the agents / workloads do", "what has <user>',
+      'done", "summarise the last N hours", "anything suspicious"). Reads the Okta System Log AND the',
+      'OPA audit (pam.* events) for the window on behalf of the signed-in admin, classifies every',
+      'event and returns a compact JSON report: humanDrivenAgentActivity (AI agents acting for humans',
+      'via XAA/ID-JAG, CIBA, token-exchange, Agent Gateway), chainsByHuman (per person: agents used,',
+      'OPA servers reached, CIBA approvals, timeline), autonomousWorkloads, anomalies,',
+      'privilegedHumanActivity and aggregated routineSignIns. Prefer this over paging raw /logs.',
+    ].join(' '),
+    input_schema: {
+      type: 'object',
+      properties: {
+        hours: { type: 'number', description: 'Look-back window in hours (default 24, max 168). Ignored when since is given.' },
+        since: { type: 'string', description: 'Optional ISO-8601 start, e.g. 2026-09-17T00:00:00Z' },
+        until: { type: 'string', description: 'Optional ISO-8601 end (default: now)' },
+        user: { type: 'string', description: 'Optional: restrict to one person (name, login or Okta user id substring)' },
+        detail: { type: 'string', enum: ['brief', 'full'], description: 'brief = shorter report (default for small models)' },
+      },
+      required: [],
+    },
+  }
+
+  // Directory roster — deterministic "who is in X and when did they last log in" answers.
+  const ROSTER_TOOL = {
+    name: 'directory_roster',
+    description: [
+      'Membership + last-login roster from the DIRECTORY (user profile lastLogin/status, all time).',
+      'Use for: who has / has not logged in, never logged in, last login, inactive for N days, not',
+      'activated, members of a group, holders of an admin role ("which Super Admins…" → role=SUPER_ADMIN).',
+      'Pass group=<exact name or 00g… id> OR role=<SUPER_ADMIN|ORG_ADMIN|APP_ADMIN|USER_ADMIN|…>.',
+      'Returns neverLoggedIn / inactive / active buckets with name, login, status, lastLogin,',
+      'daysSinceLogin. If the group name is ambiguous it returns needsClarification + candidates:',
+      'show them and ask — do not guess. Not for "what happened" questions (use tenant_activity_report).',
+    ].join(' '),
+    input_schema: {
+      type: 'object',
+      properties: {
+        group: { type: 'string', description: 'Group name (exact, case-insensitive) or 00g… id' },
+        role: { type: 'string', description: 'Admin role type, e.g. SUPER_ADMIN, ORG_ADMIN, APP_ADMIN, USER_ADMIN, HELP_DESK_ADMIN, READ_ONLY_ADMIN' },
+        inactiveDays: { type: 'number', description: 'Threshold for the "inactive" bucket (default 30)' },
+      },
+      required: [],
+    },
+  }
+
+  // All tools (sent in OpenAI function-calling shape).
+  const ALL_TOOLS = [ACTIVITY_TOOL, ROSTER_TOOL, OKTA_TOOL, ACCESS_REQUEST_TOOL, ACCESS_REQUEST_STATUS_TOOL, SECRET_TOOL]
+
+  // Small models get the brief report and tighter raw-log caps.
+  const smallModel = /gemma/i.test(resolveChatModel(model).id)
 
   const pendingAccessRequests = []
 
@@ -531,6 +696,33 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
     }
 
+    if (toolName === 'tenant_activity_report') {
+      const gate = await requireDelegatedScope(req, 'sdap.logs.read')
+      if (gate.error) return gate
+      const win = parseActivityWindow(toolInput || {})
+      if (win.error) return win
+      const detail = toolInput?.detail === 'brief' || toolInput?.detail === 'full' ? toolInput.detail : (smallModel ? 'brief' : 'full')
+      try {
+        const report = await runActivityReport({ ...win, detail, user: toolInput?.user })
+        console.log(`[AGENT TOOL] tenant_activity_report ${win.since}..${win.until} -> ${report.fetched?.events} events, ${JSON.stringify(report).length} bytes (${detail})`)
+        return report
+      } catch (e) {
+        return { error: `Activity report failed: ${e.message}` }
+      }
+    }
+
+    if (toolName === 'directory_roster') {
+      const gate = await requireDelegatedScope(req, 'sdap.users.read')
+      if (gate.error) return gate
+      try {
+        const out = await directoryRoster(oktaCfg(), { group: toolInput?.group, role: toolInput?.role, inactiveDays: Number(toolInput?.inactiveDays) || 30 })
+        console.log(`[AGENT TOOL] directory_roster ${JSON.stringify({ group: toolInput?.group, role: toolInput?.role })} -> ${out.roster ? out.roster.total + ' users' : (out.needsClarification ? 'needs clarification' : 'error')}`)
+        return out
+      } catch (e) {
+        return { error: `Directory roster failed: ${e.message}` }
+      }
+    }
+
     if (toolName !== 'fetch_okta_data') return { error: `Unknown tool: ${toolName}` }
     const rawPath = toolInput.path || '/'
     const oktaPath = rawPath.replace(/^\/api\/agent\/okta/, '') // strip prefix if model added it
@@ -606,6 +798,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const text = await oktaRes.text()
       let data
       try { data = JSON.parse(text) } catch { data = text }
+      if (/^\/logs/.test(oktaPath) && Array.isArray(data)) {
+        // Raw events are ~3 KB each; hand the model one compact line per event instead.
+        const cap = smallModel ? 40 : 150
+        const events = data.slice(0, cap).map(compactEvent)
+        return {
+          status: oktaRes.status, count: data.length, returned: events.length, truncated: data.length > cap,
+          ...(data.length > cap ? { hint: 'Narrow with filter= or a shorter window; or call tenant_activity_report.' } : {}),
+          events,
+        }
+      }
       return { status: oktaRes.status, data }
     } catch (e) {
       return { error: `Okta API call failed: ${e.message}` }
@@ -615,115 +817,38 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   try {
     let content = ''
 
-    if (provider === 'anthropic' && process.env.ANTHROPIC_API_KEY) {
-      // Anthropic: native tool_use with agentic loop (up to 5 tool rounds)
-      const anthropicTools = ALL_TOOLS.map(t => ({
-        name: t.name,
-        description: t.description,
-        input_schema: t.input_schema,
-      }))
-      let loopMessages = messages.filter(m => m.role !== 'system')
-      for (let round = 0; round < 5; round++) {
-        const resp = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-api-key': process.env.ANTHROPIC_API_KEY,
-            'anthropic-version': '2023-06-01',
-          },
-          body: JSON.stringify({
-            model: model || 'claude-sonnet-4-6',
-            max_tokens: 4096,
-            system: systemPrompt,
-            tools: anthropicTools,
-            messages: loopMessages,
-          }),
-        })
-        if (!resp.ok) {
-          const errorText = await resp.text()
-          console.error('Anthropic API error:', resp.status, errorText)
-          throw new Error(`Anthropic error ${resp.status}: ${errorText}`)
-        }
-        const data = await resp.json()
-        if (data.stop_reason === 'end_turn' || !data.content?.some(b => b.type === 'tool_use')) {
-          content = data.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') || 'No response from Claude'
-          break
-        }
-        // Process tool calls
-        loopMessages.push({ role: 'assistant', content: data.content })
-        const toolResults = []
-        for (const block of data.content) {
-          if (block.type !== 'tool_use') continue
-          console.log(`[AGENT TOOL] ${block.name}(${JSON.stringify(block.input)})`)
-          const result = await runTool(block.name, block.input)
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) })
-        }
-        loopMessages.push({ role: 'user', content: toolResults })
+    if (!llmGatewayConfigured()) throw new Error('No LLM gateway configured. Set LLM_BASE_URL and LLM_API_KEY in .env.local and restart.')
+    const chosen = resolveChatModel(model)
+    const tools = ALL_TOOLS.map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: t.input_schema },
+    }))
+    const endpoint = `${process.env.LLM_BASE_URL.replace(/\/+$/, '')}/chat/completions`
+    let loopMessages = [...fullMessages]
+    for (let round = 0; round < 5; round++) {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${process.env.LLM_API_KEY}` },
+        body: JSON.stringify({ model: chosen.id, messages: loopMessages, tools, max_tokens: 4096 }),
+      })
+      if (!resp.ok) throw new Error(`LLM gateway error ${resp.status}: ${await resp.text()}`)
+      const data = await resp.json()
+      const choice = data.choices?.[0]
+      if (choice?.finish_reason !== 'tool_calls' || !choice?.message?.tool_calls?.length) {
+        content = choice?.message?.content || 'No response from the model'; break
       }
-
-    } else if (provider === 'grok' && process.env.GROK_API_KEY) {
-      // Grok / OpenAI-compat: function calling loop
-      const tools = ALL_TOOLS.map(t => ({
-        type: 'function',
-        function: { name: t.name, description: t.description, parameters: t.input_schema },
-      }))
-      let loopMessages = [...fullMessages]
-      for (let round = 0; round < 5; round++) {
-        const resp = await fetch('https://api.x.ai/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${process.env.GROK_API_KEY}` },
-          body: JSON.stringify({ model: model || 'grok-4.3', messages: loopMessages, tools, max_tokens: 4096 }),
-        })
-        if (!resp.ok) throw new Error(`Grok error ${resp.status}: ${await resp.text()}`)
-        const data = await resp.json()
-        const choice = data.choices?.[0]
-        if (choice?.finish_reason !== 'tool_calls' || !choice?.message?.tool_calls?.length) {
-          content = choice?.message?.content || 'No response from Grok'; break
-        }
-        loopMessages.push(choice.message)
-        const toolMsgs = []
-        for (const tc of choice.message.tool_calls) {
-          let input; try { input = JSON.parse(tc.function.arguments) } catch { input = {} }
-          console.log(`[AGENT TOOL] ${tc.function.name}(${tc.function.arguments})`)
-          const result = await runTool(tc.function.name, input)
-          toolMsgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
-        }
-        loopMessages.push(...toolMsgs)
+      loopMessages.push(choice.message)
+      const toolMsgs = []
+      for (const tc of choice.message.tool_calls) {
+        let input; try { input = JSON.parse(tc.function.arguments) } catch { input = {} }
+        console.log(`[AGENT TOOL] ${tc.function.name}(${tc.function.arguments})`)
+        const result = await runTool(tc.function.name, input)
+        toolMsgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
       }
-
-    } else {
-      // OpenAI: function calling loop
-      if (!process.env.OPENAI_API_KEY) throw new Error('No LLM API keys configured. Add OPENAI_API_KEY (or ANTHROPIC/GROK) to .env and restart.')
-      const tools = ALL_TOOLS.map(t => ({
-        type: 'function',
-        function: { name: t.name, description: t.description, parameters: t.input_schema },
-      }))
-      let loopMessages = [...fullMessages]
-      for (let round = 0; round < 5; round++) {
-        const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}` },
-          body: JSON.stringify({ model: model || 'gpt-4o', messages: loopMessages, tools, temperature: 0.4, max_tokens: 4096 }),
-        })
-        if (!resp.ok) throw new Error(`OpenAI error ${resp.status}: ${await resp.text()}`)
-        const data = await resp.json()
-        const choice = data.choices?.[0]
-        if (choice?.finish_reason !== 'tool_calls' || !choice?.message?.tool_calls?.length) {
-          content = choice?.message?.content || 'No response'; break
-        }
-        loopMessages.push(choice.message)
-        const toolMsgs = []
-        for (const tc of choice.message.tool_calls) {
-          let input; try { input = JSON.parse(tc.function.arguments) } catch { input = {} }
-          console.log(`[AGENT TOOL] ${tc.function.name}(${tc.function.arguments})`)
-          const result = await runTool(tc.function.name, input)
-          toolMsgs.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) })
-        }
-        loopMessages.push(...toolMsgs)
-      }
+      loopMessages.push(...toolMsgs)
     }
 
-    res.json({ content, model, provider: provider || 'openai', pendingAccessRequests })
+    res.json({ content, model: chosen.id, provider: chosen.provider, pendingAccessRequests })
 
   } catch (err) {
     console.error('LLM proxy error:', err.message)
@@ -1047,6 +1172,38 @@ app.get(['/api/agent/okta/me', '/api/agent/registry'], requireAuth, async (req, 
 })
 
 // ======================
+// Pre-digested activity report — same classifier the chat agent uses (lib/agentActivity.js).
+// XAA-gated exactly like /api/agent/okta/logs (needs sdap.logs.read for the signed-in admin).
+// ======================
+app.get('/api/agent/okta/activity', requireAuth, async (req, res) => {
+  const gate = await requireDelegatedScope(req, 'sdap.logs.read')
+  if (gate.error) return res.status(gate.reauth ? 401 : 403).json(gate)
+  const win = parseActivityWindow(req.query)
+  if (win.error) return res.status(400).json(win)
+  try {
+    const report = await runActivityReport({
+      ...win,
+      detail: req.query.detail === 'brief' ? 'brief' : 'full',
+      user: req.query.user ? String(req.query.user) : null,
+    })
+    res.json(report)
+  } catch (e) {
+    res.status(502).json({ error: 'Activity report failed', detail: e.message })
+  }
+})
+
+app.get('/api/agent/okta/roster', requireAuth, async (req, res) => {
+  const gate = await requireDelegatedScope(req, 'sdap.users.read')
+  if (gate.error) return res.status(gate.reauth ? 401 : 403).json(gate)
+  if (!req.query.group && !req.query.role) return res.status(400).json({ error: 'Pass group=<name|00g id> or role=<SUPER_ADMIN|…>' })
+  try {
+    res.json(await directoryRoster(oktaCfg(), { group: req.query.group ? String(req.query.group) : undefined, role: req.query.role ? String(req.query.role) : undefined, inactiveDays: Number(req.query.inactiveDays) || 30 }))
+  } catch (e) {
+    res.status(502).json({ error: 'Directory roster failed', detail: e.message })
+  }
+})
+
+// ======================
 // OPA vaulted-secret retrieval via agent token exchange (Okta "secret" resource type).
 // Exchanges the signed-in admin's id_token for a secret connected to the agent in Okta
 // Privileged Access. Pass {resource} in the body to override OPA_SECRET_RESOURCE while testing.
@@ -1153,6 +1310,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✓ SDAP API server running on http://0.0.0.0:${PORT}`)
   console.log(`  Demo auth bypass: ${process.env.DEMO_AUTH_BYPASS === 'true'}`)
   console.log(`  OIDC client configured: ${!!process.env.OKTA_OIDC_CLIENT_ID}`)
-  console.log(`  LLM keys present (boolean): OpenAI=${!!process.env.OPENAI_API_KEY} Anthropic=${!!process.env.ANTHROPIC_API_KEY} Grok=${!!process.env.GROK_API_KEY}`)
+  console.log(`  LLM gateway configured: ${llmGatewayConfigured()} (default model: ${resolveChatModel().id})`)
   console.log(`  Okta token present: ${!!process.env.OKTA_API_TOKEN}`)
 })

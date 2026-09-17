@@ -23,6 +23,8 @@ type ModelOption = {
   id: string
   label: string
   provider: string
+  /** The server's CHAT_DEFAULT_MODEL */
+  default?: boolean
 }
 
 interface PendingAccessRequest {
@@ -155,9 +157,9 @@ function App() {
           setSelectedModel(prev => {
             if (prev && models.some(m => m.id === prev)) return prev
 
-            // Prefer Grok if available
-            const grokModel = models.find(m => m.provider === 'grok')
-            if (grokModel) return grokModel.id
+            // Preselect the server's default (CHAT_DEFAULT_MODEL)
+            const defaultModel = models.find(m => m.default)
+            if (defaultModel) return defaultModel.id
 
             return models[0].id
           })
@@ -445,7 +447,7 @@ function App() {
     updateCurrentConversation(newMessages)
 
     try {
-      const modelConfig = availableModels.find(m => m.id === selectedModel) || { provider: 'openai' }
+      const modelConfig = availableModels.find(m => m.id === selectedModel) || { provider: 'litellm' }
       
       const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
@@ -989,7 +991,7 @@ function App() {
                     </div>
                     <div className="info-card">
                       <div className="font-medium mb-2 text-base">LLM Configuration</div>
-                      <div className="text-[#a1a1aa] leading-relaxed">Keys are loaded server-side from <code className="text-[#f97316] bg-[#1f1f23] px-1.5 py-0.5 rounded">.env</code>. Add OPENAI_API_KEY etc. then restart api process.</div>
+                      <div className="text-[#a1a1aa] leading-relaxed">Keys are loaded server-side from <code className="text-[#f97316] bg-[#1f1f23] px-1.5 py-0.5 rounded">.env</code>. Set LLM_BASE_URL and LLM_API_KEY (an OpenAI-compatible gateway such as LiteLLM), then restart the api process. Models: gemma4 or grok-4.3.</div>
                     </div>
                     <div className="info-card">
                       <div className="font-medium mb-2 text-base">MCP Server</div>

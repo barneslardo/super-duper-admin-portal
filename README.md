@@ -64,7 +64,7 @@ Both are configurable via `PORT` / `API_PORT` in `.env.local`.
 
 See [.env.example](.env.example). Minimum for chat to work:
 
-- `OPENAI_API_KEY` (or ANTHROPIC_API_KEY / GROK_API_KEY)
+- `LLM_BASE_URL` + `LLM_API_KEY` (OpenAI-compatible gateway, e.g. LiteLLM; models `gemma4` or `grok-4.3`)
 - `OKTA_API_TOKEN` (SSWS token with at least read users + logs)
 - `OKTA_ORG_URL=https://sledai.oktapreview.com`
 

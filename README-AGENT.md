@@ -51,8 +51,9 @@ cp .env.example .env.local
 Minimal `.env.local` to start (get real values from the engineer):
 
 ```env
-OPENAI_API_KEY=<from engineer>        # or ANTHROPIC_API_KEY / GROK_API_KEY
-DEFAULT_LLM_PROVIDER=openai
+LLM_BASE_URL=<OpenAI-compatible gateway, e.g. LiteLLM>/v1
+LLM_API_KEY=<from engineer>
+CHAT_DEFAULT_MODEL=gemma4                # or grok-4.3
 OKTA_ORG_URL=https://<your-org>.oktapreview.com
 OKTA_API_DOMAIN=<your-org>.oktapreview.com
 OKTA_API_TOKEN=<from engineer — see 2a>
@@ -117,6 +118,37 @@ Register in the engineer's MCP client (Claude Desktop / Cursor):
 
 It shells the same env config — `.env.local` must be present in `cwd`.
 
+### 2f. Activity report — the deterministic path for "what is going on?" questions
+
+`lib/agentActivity.js` fetches a bounded window of the Okta System Log (OPA audit events arrive in
+the same feed as `pam.*`), classifies every event into a tier — `agent` (interactive = an AI agent
+acting for a human via XAA/ID-JAG, CIBA, token-exchange or the Agent Gateway; autonomous = a
+workload minting its own token), `privileged`, `infra` (AD/OPS agents, OPA/IGA connectors — never
+called AI agents), `routine` (SSO/MFA sign-ins, aggregated) — folds repeated steps into one line
+(`×N`), and builds per-human chains (agents used, OPA servers reached, CIBA approvals, timeline).
+
+- Chat tool `tenant_activity_report {hours|since|until, user, detail}` — the system prompt tells the
+  model to call it FIRST for any broad activity question and to lead with human-driven agent
+  activity. Small models (gemma4) get `detail=brief` (≈10 KB) automatically; grok gets `full`.
+- Raw `/logs` results from `fetch_okta_data` are now compacted to one object per event with a
+  ready-made `summary` line (40 events for gemma4, 150 otherwise).
+- HTTP: `GET /api/agent/okta/activity?hours=24&user=<login>&detail=brief|full` (XAA-gated like
+  `/logs`, needs `sdap.logs.read`).
+- Tuning: extend infrastructure principals with `ACTIVITY_INFRA_PRINCIPALS="name1,name2"`.
+- `directory_roster {group | role, inactiveDays}` (`lib/directoryRoster.js`) answers the *directory*
+  questions the log window cannot: who has / has not logged in, never logged in, inactive, members of
+  a group, holders of an admin role. Groups resolve by exact name, `00g…` id or prefix; with no exact
+  match the tool returns `needsClarification` + candidates and the prompt tells the model to ask, not
+  guess. Roles come from the Role Assignment API (`/iam/assignees/users` + `/users/{id}/roles`, direct
+  and group-derived). HTTP twin: `GET /api/agent/okta/roster?group=…|role=SUPER_ADMIN`.
+- The activity report pages newest-first up to 16 × 1000 events (a 7-day window here is ≈12.5 k
+  events, ≈8 s); if the cap hits, `warnings[]` states the covered range and the prompt makes the
+  model say so. `peopleSeen` lists every person with any event so nobody is hidden by top-N caps.
+- Checks without a browser session (read-only, SSWS token):
+  `node scripts/activity-report-check.mjs 24 brief` prints the report and its size;
+  `node scripts/chat-harness.mjs gemma4 "what is going on in the tenant today?"` runs the real
+  system prompt + tools through the LLM gateway and shows which tools the model called.
+
 ## Phase 3 — Deploying (EC2 or similar)
 
 - Security group: expose **only 80/443**; reverse proxy (nginx/Caddy/ALB) in front. Two workable shapes:
@@ -138,6 +170,9 @@ It shells the same env config — `.env.local` must be present in `cwd`.
 | Okta/LLM calls time out on the host but curl works | DNS — `dnsBootstrap` pins 1.1.1.1/8.8.8.8; set `DNS_SERVERS` for VPC-internal resolvers. |
 
 ## File map (orientation)
+
+- `lib/directoryRoster.js` — group/role membership with lastLogin/status behind the `directory_roster` chat tool and `/api/agent/okta/roster`.
+- `lib/agentActivity.js` — System Log classifier + activity report behind the `tenant_activity_report` chat tool and `/api/agent/okta/activity`; `scripts/activity-report-check.mjs` and `scripts/chat-harness.mjs` exercise it offline.
 
 ```
 api-server.js                    all API routes (chat, okta proxy, auth, actions)

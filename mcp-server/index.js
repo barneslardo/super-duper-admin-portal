@@ -66,7 +66,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: 'object',
           properties: {
             message: { type: 'string', description: 'The question or command for the admin assistant' },
-            model: { type: 'string', description: 'Optional model id (gpt-4o, claude-3-5-sonnet-20241022, grok-4.3)' },
+            model: { type: 'string', description: 'Optional model id: gemma4 or grok-4.3 (default: CHAT_DEFAULT_MODEL on the API)' },
           },
           required: ['message'],
         },
@@ -116,7 +116,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         messages: [{ role: 'user', content: message }],
-        model: model || 'gpt-4o',
+        model: model || undefined, // omitted -> the API's CHAT_DEFAULT_MODEL
       }),
     })
     if (!resp.ok) {
